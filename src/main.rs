@@ -3,7 +3,7 @@ use std::{fmt::Debug, time::{UNIX_EPOCH, SystemTime}, collections::HashMap, hash
 use macroquad::{prelude::*, rand::{ChooseRandom, srand}, telemetry::ZoneGuard};
 
 
-const TILE_SIZE: f32 = 16.;
+const TILE_SIZE: f32 = 8.;
 const PATTERN_SIZE: f32 = 32.;
 const SCREEN_WIDTH: f32 = 1600.;
 const SCREEN_HEIGHT: f32 = 960.;
@@ -32,31 +32,46 @@ fn index_from_xy(x: usize, y: usize, width: usize) -> usize {
   x + y * width
 }
 
-fn image_to_textures(image: &Image, n: usize, step: usize) -> Vec<Texture2D> {
+fn image_to_textures(image: &Image, step: usize) -> (Vec<Texture2D>, Vec<u32>) {
   let mut textures = vec![];
+  let mut weights = vec![];
   if image.width() % step != 0 {
-    return textures
+    return (textures, weights)
   }
 
-  let mut act_step = 0;
-  while act_step < image.width() {
+  let mut x = 0;
+  let mut y = 0;
+  while x < image.width() && y < image.height() {
     for rot in 0..4 {
-      let img = image.sub_image(Rect::new(act_step as f32, 0., n as f32, n as f32));
+      let img = image.sub_image(Rect::new(x as f32, y as f32, step as f32, step as f32));
       let img = rotate_image(&img, rot);
       let tex = Texture2D::from_image(&img);
       tex.set_filter(FilterMode::Nearest);
 
-      let is_original = !textures.iter().any(|t| {
-        t.get_texture_data().get_image_data() == tex.get_texture_data().get_image_data()
+      let existing_texture_index = textures.iter().enumerate().find_map(|(i, t)| {
+        if t.get_texture_data().get_image_data() == tex.get_texture_data().get_image_data() {
+          Some(i)
+        } else {
+          None
+        }
       });
 
-      if is_original {
+      if let Some(i) = existing_texture_index {
+        if rot == 0 {
+          weights[i] += 1;
+        }
+      } else {
         textures.push(tex);
-      }
+        weights.push(1);
+      };
     }
-    act_step += step;
+    x += step;
+    if x >= image.width() {
+      x = 0;
+      y += step;
+    }
   }
-  textures
+  (textures, weights)
 }
 
 fn color_to_slice(c: &Color) -> [u8; 4] {
@@ -115,6 +130,7 @@ fn get_edge_colors(tex: &Texture2D) -> Edges {
 struct Pattern  {
   texture_index: usize,
   edges: [usize; 4],
+  weight: u32,
 }
 
 impl Debug for Pattern {
@@ -124,25 +140,26 @@ impl Debug for Pattern {
 }
 
 impl Pattern {
-  pub fn new(texture_index: usize, texture_edges: &Vec<[usize; 4]>) -> Self {
+  pub fn new(texture_index: usize, texture_edges: &Vec<[usize; 4]>, weight: u32) -> Self {
 
     Self {
       texture_index,
       edges: texture_edges[texture_index],
+      weight,
     }
   }
 
-  pub fn draw(&self, x: f32, y: f32, res: &[Texture2D]) {
-    draw_texture_ex(
-      res[self.texture_index],
-      x, y,
-      WHITE,
-      DrawTextureParams {
-        dest_size: Some(vec2(TILE_SIZE, TILE_SIZE)),
-        ..Default::default()
-      },
-    );
-  }
+  // pub fn draw(&self, x: f32, y: f32, res: &[Texture2D]) {
+  //   draw_texture_ex(
+  //     res[self.texture_index],
+  //     x, y,
+  //     WHITE,
+  //     DrawTextureParams {
+  //       dest_size: Some(vec2(TILE_SIZE, TILE_SIZE)),
+  //       ..Default::default()
+  //     },
+  //   );
+  // }
 }
 
 #[derive(Clone, Debug)]
@@ -159,17 +176,30 @@ impl MapTile {
     }
   }
 
-  pub fn draw(&self, x: f32, y: f32, res: &[Texture2D]) {
-    if let Some(collapsed) = &self.collapsed {
-      collapsed.draw(x, y, res);
-    } else {
-      let _font_size = TILE_SIZE;
-      if self.options.len() == 0 {
-        draw_rectangle(x, y, TILE_SIZE, TILE_SIZE, RED);
-      }
-      // draw_text(&format!("{}", self.options.len()), x, y + font_size, font_size, BLACK);
-    }
+  pub fn choose_pattern(&mut self) -> Pattern {
+    let total_weights = self.options.iter().fold(0, |acc, p| acc + p.weight);
+    let mut target_weight = rand::gen_range(0, total_weights+1) as i32;
+    self.options
+      .iter()
+      .find(|p| {
+        target_weight -= p.weight as i32;
+        target_weight <= 0
+      })
+      .unwrap()
+      .clone()
   }
+
+  // pub fn draw(&self, x: f32, y: f32, res: &[Texture2D]) {
+  //   if let Some(collapsed) = &self.collapsed {
+  //     collapsed.draw(x, y, res);
+  //   } else {
+  //     let _font_size = TILE_SIZE;
+  //     if self.options.len() == 0 {
+  //       draw_rectangle(x, y, TILE_SIZE, TILE_SIZE, RED);
+  //     }
+  //     // draw_text(&format!("{}", self.options.len()), x, y + font_size, font_size, BLACK);
+  //   }
+  // }
 }
 
 #[derive(Clone)]
@@ -177,6 +207,8 @@ struct Map {
   width: usize,
   height: usize,
   tiles: Vec<MapTile>,
+  image: Image,
+  texture: Texture2D,
   history: Vec<(Vec<(MapTile, usize)>, Pattern)>
 }
 
@@ -186,8 +218,9 @@ impl Map {
     for _ in 0..width * height{
       tiles.push(MapTile::new(options.clone()));
     }
+    let image = Image::gen_image_color((width * PATTERN_SIZE as usize) as u16, (height * PATTERN_SIZE as usize) as u16, DARKGRAY);
 
-    Self { width, height, tiles, history: vec![]  }
+    Self { width, height, tiles, history: vec![], image: image.clone(), texture: Texture2D::from_image(&image)  }
   }
 
   pub fn reset(&mut self, options: &Vec<Pattern>) {
@@ -198,12 +231,24 @@ impl Map {
     self.history.clear();
   }
 
-  pub fn draw(&self, res: &[Texture2D]) {
-    let _z = ZoneGuard::new("draw");
-    for i in 0..self.tiles.len() {
-      let (x, y) = xy_from_index(i, self.width);
-      self.tiles[i].draw(x as f32 *  TILE_SIZE, y as f32 *  TILE_SIZE, res);
-    }
+  // pub fn draw(&self, res: &[Texture2D]) {
+  //   let _z = ZoneGuard::new("draw");
+  //   for i in 0..self.tiles.len() {
+  //     let (x, y) = xy_from_index(i, self.width);
+  //     self.tiles[i].draw(x as f32 *  TILE_SIZE, y as f32 *  TILE_SIZE, res);
+  //   }
+  // }
+
+  pub fn draw_image(&self) {
+    draw_texture_ex(
+      self.texture,
+      0., 0.,
+      WHITE,
+      DrawTextureParams {
+        dest_size: Some(vec2(self.width as f32 * TILE_SIZE, self.height as f32 * TILE_SIZE)),
+        ..Default::default()
+      },
+    );
   }
 
   pub fn compare(&mut self, pattern: &Pattern, x: usize, y: usize, edge_size_i: usize, edge_size_j: usize) {
@@ -261,16 +306,29 @@ impl Map {
     idx
   }
 
-  pub fn step(&mut self) -> bool {
+  pub fn apply_collapse(&mut self, pattern: &Pattern, x: usize, y: usize, res: &[Texture2D]) {
+    let image = res[pattern.clone().texture_index].get_texture_data();
+    for ix in 0..(PATTERN_SIZE as u32) {
+      for iy in 0..(PATTERN_SIZE as u32) {
+        self.image.set_pixel((x * PATTERN_SIZE as usize) as u32 + ix, (y * PATTERN_SIZE as usize) as u32 + iy, image.get_pixel(ix, iy));
+      }
+    }
+    self.texture.update(&self.image);
+  }
+
+  pub fn step(&mut self, res: &[Texture2D]) -> bool {
     let _z = ZoneGuard::new("step");
     if let Some((x, y)) = self.lowest_entropy_tile() {
       let map_tiles = self.get_surrounding_indexes(x, y).iter().map(|i| (self.tiles[*i].clone(), *i)).collect();
       if let Some(pattern) = self.collapse(x, y) {
         let _z = ZoneGuard::new("step");
+        self.apply_collapse(&pattern, x, y, res);
+
         self.history.push((map_tiles, pattern));
         if self.history.len() - 1 == HISTORY_LENGTH {
           self.history.remove(0);
         }
+
         return true;
       } else if self.history.len() > 0 {
         self.unwind();
@@ -315,7 +373,8 @@ impl Map {
       return None;
     }
 
-    let pattern = self.tiles[i].options.choose().unwrap().clone();
+    // let pattern = self.tiles[i].options.choose().unwrap().clone();
+    let pattern = self.tiles[i].choose_pattern();
 
     //top
     if y != 0 {
@@ -356,19 +415,20 @@ fn rotate_image(image: &Image, rot: usize) -> Image {
   new_image
 }
 
-fn draw_patterns(resource: &Vec<Texture2D>, _texture_edges: &Vec<[usize; 4]>) {
-  let mut x = TILE_SIZE;
-  let mut y = TILE_SIZE;
-  for (_i, r) in resource.iter().enumerate() {
+fn draw_patterns(resources: &[Texture2D], patterns: &[Pattern]) {
+  let mut x = PATTERN_SIZE;
+  let mut y = PATTERN_SIZE;
+  for p in patterns {
     // draw_text(&format!("{}", texture_edges[i][0]), x, y - TILE_SIZE / 4., 2. * TILE_SIZE, BLACK);
     // draw_text(&format!("{}", texture_edges[i][1]), x + TILE_SIZE, y + TILE_SIZE / 2., 2. * TILE_SIZE, BLACK);
     // draw_text(&format!("{}", texture_edges[i][2]), x, y + 1.75 * TILE_SIZE, 2. * TILE_SIZE, BLACK);
     // draw_text(&format!("{}", texture_edges[i][3]), x - TILE_SIZE / 2., y + TILE_SIZE / 2., 2. * TILE_SIZE, BLACK);
-    draw_texture(*r, x, y, WHITE);
-    x += TILE_SIZE + 2. * TILE_SIZE;
+    draw_texture(resources[p.texture_index], x, y, WHITE);
+    draw_text(&format!("{}", p.weight), x, y, PATTERN_SIZE, BLACK);
+    x += PATTERN_SIZE + 2. * PATTERN_SIZE;
     if x > SCREEN_WIDTH {
-      x = TILE_SIZE;
-      y += TILE_SIZE + 2. * TILE_SIZE;
+      x = PATTERN_SIZE;
+      y += PATTERN_SIZE + 2. * PATTERN_SIZE;
     }
   }
 }
@@ -376,28 +436,24 @@ fn draw_patterns(resource: &Vec<Texture2D>, _texture_edges: &Vec<[usize; 4]>) {
 #[macroquad::main(window_conf)]
 async fn main() {
   set_pc_assets_folder("assets");
-  let image = load_texture("tiles.png").await.expect("tiles.png should be loaded").get_texture_data();
-  let resources = image_to_textures(&image, PATTERN_SIZE as usize, PATTERN_SIZE as usize);
+  let image = load_texture("template-1.png").await.expect("tiles.png should be loaded").get_texture_data();
+  let (resources, weights) = image_to_textures(&image, PATTERN_SIZE as usize);
   let texture_edges = get_edges_for_textures(&resources);
-  let options: Vec<Pattern> = resources.clone().iter().enumerate().map(|(i, _tex)| Pattern::new(i, &texture_edges)).collect();
+  let options: Vec<Pattern> = resources.clone().iter().enumerate().map(|(i, _tex)| Pattern::new(i, &texture_edges, weights[i])).collect();
   let mut map = Map::new(&options, (SCREEN_WIDTH / TILE_SIZE) as usize, (SCREEN_HEIGHT / TILE_SIZE) as usize);
   let mut play = false;
   let mut started = false;
   let mut can_continue = true;
   let since_the_epoch = SystemTime::now().duration_since(UNIX_EPOCH).expect("Time went backwards");
-  srand(since_the_epoch.as_secs());
+  let seed = since_the_epoch.as_secs();
+  srand(seed);
 
   loop {
     clear_background(DARKGRAY);
 
-    if !started {
-      draw_patterns(&resources, &texture_edges);
-      started = map.tiles.iter().any(|t| t.collapsed.is_some())
-    }
-
     if can_continue && play {
       // can_continue = map.collapse().is_some();
-      can_continue = map.step();
+      can_continue = map.step(&resources);
     }
 
     if is_key_released(KeyCode::Enter) {
@@ -405,14 +461,25 @@ async fn main() {
     }
     if can_continue && !play && is_key_released(KeyCode::Space) {
       // can_continue = map.collapse().is_some();
-      can_continue = map.step();
+      can_continue = map.step(&resources);
     }
     if !can_continue && is_key_released(KeyCode::Space) {
+      // export_map(&map, &resources);
       map.reset(&options);
       can_continue = true;
     }
+    if !can_continue && is_key_released(KeyCode::E) {
+      map.image.export_png(&format!("export-{}", seed));
+    }
 
-    map.draw(&resources);
+    if !started {
+      draw_patterns(&resources, &options);
+      started = map.tiles.iter().any(|t| t.collapsed.is_some())
+    } else {
+      // map.draw(&resources);
+      map.draw_image();
+      // map.draw_by_res_index(&resources);
+    }
 
     // draw_text(&format!("paused: {}, running: {}, history length: {}", !play, can_continue, map.history.len()), 2., 32., 30., WHITE);
     #[cfg(debug_assertions)]
