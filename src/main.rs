@@ -1,16 +1,21 @@
-use std::{cmp::Ordering, collections::{HashMap, HashSet}, time::{UNIX_EPOCH, SystemTime}, iter::FromIterator};
+use std::{collections::{HashMap, HashSet}, time::{UNIX_EPOCH, SystemTime}, iter::FromIterator};
 
 use macroquad::{prelude::*, rand::{ChooseRandom, srand}, telemetry::ZoneGuard};
 
-const TILE_SIZE: f32 = 16.;
+const TILE_SIZE: f32 = 8.;
 const SCREEN_WIDTH: f32 = 1600.;
 const SCREEN_HEIGHT: f32 = 800.;
 const N: isize = 3;
 const GRID_OFFSET: f32 = 0.;
+const HISTORY_LENGHT: usize = 10;
+const N_INDEXES: [(isize, isize); 4] = [(0, -1), (1, 0), (0, 1), (-1, 0)];
+const WRAP_W: bool = true;
+const WRAP_H: bool = true;
+const ROTATE: bool = false;
 
 fn window_conf() -> Conf {
   Conf {
-    window_title: "Simple WFC".to_owned(),
+    window_title: "WFC".to_owned(),
     window_width: SCREEN_WIDTH as i32,
     window_height: SCREEN_HEIGHT as i32,
     ..Default::default()
@@ -50,65 +55,54 @@ fn rotate_image(image: &Image, rot: usize) -> Image {
   new_image
 }
 
+fn get_pattern_image(src_image: &Image, n: isize, x: u16, y: u16) -> Image {
+  let mut pattern_image = Image::gen_image_color(n as u16, n as u16, WHITE);
+  for px in 0..n {
+    for py in 0..n {
+      let color = src_image.get_pixel(((x + px as u16) % src_image.width) as u32 , ((y + py as u16) % src_image.height) as u32);
+      pattern_image.set_pixel(
+        px as u32,
+        py as u32,
+        color
+      );
+    }
+  }
+  pattern_image
+}
+
 fn extract_patterns_as_images(image: &Image, n: isize) -> Vec<Image> {
   let mut patterns: Vec<Image> = vec![];
 
-  for x in 0..image.width as u16 {
-    for y in 0..image.height as u16 {
-      let mut pattern_image = Image::gen_image_color(n as u16, n as u16, WHITE);
-      for px in 0..n {
-        for py in 0..n {
-          let color = image.get_pixel(((x + px as u16) % image.width) as u32 , ((y + py as u16) % image.height) as u32);
-          pattern_image.set_pixel(
-            px as u32,
-            py as u32,
-            color
-          );
+  let width = if WRAP_W { image.width } else { image.width - n as u16 };
+  let height = if WRAP_H { image.height } else { image.height - n as u16 };
+
+  for x in 0..width {
+    for y in 0..height {
+      let pattern_image = get_pattern_image(image, n, x, y);
+      if ROTATE {
+        for rot in 1..4 {
+          let rotated_image = rotate_image(&pattern_image, rot);
+          if patterns.iter().all(|p| p.get_image_data() != rotated_image.get_image_data()) {
+            patterns.push(rotated_image);
+          }
         }
       }
-      // for rot in 0..MAX_ROT {
-      //   let pattern_image = rotate_image(&pattern_image, rot);
-        if patterns.iter().all(|p| p.get_image_data() != pattern_image.get_image_data()) {
-          patterns.push(pattern_image);
-        }
-      // }
+      if patterns.iter().all(|p| p.get_image_data() != pattern_image.get_image_data()) {
+        patterns.push(pattern_image);
+      }
     }
   }
 
   patterns
 }
 
-fn images_to_textures(patterns: &[Image]) -> Vec<Texture2D> {
-  patterns.into_iter()
-    .map(|img| {
-      let tex = Texture2D::from_image(&img);
-      tex.set_filter(FilterMode::Nearest);
-      tex
-    })
-    .collect()
-}
-
-fn overlap_indexes(n: isize) -> Vec<(isize, isize)> {
-  // let mut idxes = vec![];
-  // for x in -n+1..n {
-  //   for y in -n+1..n {
-  //     if x != 0 || y != 0 {
-  //       idxes.push((x, y))
-  //     }
-  //   }
-  // }
-  // idxes
-  vec![(0, -1), (1, 0), (0, 1), (-1, 0)]
-}
-
 type OverlapData = Vec<HashMap<(isize, isize), Vec<usize>>>;
 
 fn create_overlap_patterns(patterns: &[Image], n: isize) -> OverlapData  {
-  let overlap_idxes = overlap_indexes(n);
   let mut texture_overlaps = vec![];
   for img in patterns {
     let mut overlap_pattern = HashMap::new();
-    for (ox, oy) in &overlap_idxes {
+    for (ox, oy) in N_INDEXES {
       let mut valid_tex_idxes = vec![];
       for (overlap_idx, overlap_img) in patterns.iter().enumerate() {
         let mut valid = true;
@@ -129,14 +123,14 @@ fn create_overlap_patterns(patterns: &[Image], n: isize) -> OverlapData  {
         }
       }
       valid_tex_idxes.reverse();
-      overlap_pattern.insert((*ox, *oy), valid_tex_idxes);
+      overlap_pattern.insert((ox, oy), valid_tex_idxes);
     }
     texture_overlaps.push(overlap_pattern);
   }
   texture_overlaps
 }
 
-fn draw_patterns(y_offset: f32, pattern_indexes: &[usize], patterns: &[Texture2D], text: &str, overlaps: &OverlapData) {
+fn draw_patterns(y_offset: f32, pattern_indexes: &[usize], patterns: &[Texture2D], text: &str) {
   let start_x = 100. + 10. * TILE_SIZE;
   let mut x = start_x;
   let mut y = y_offset;
@@ -144,21 +138,6 @@ fn draw_patterns(y_offset: f32, pattern_indexes: &[usize], patterns: &[Texture2D
   for tex_id in pattern_indexes {
     let tex = patterns[*tex_id];
 
-    // let tex_overlap = &overlaps[tex_id];
-    // for ((ox, oy), overlap_idxes) in tex_overlap {
-    //   let (dx, dy) = (x + 80. * *ox as f32 - 10., y + 80. * *oy as f32- 10.);
-    //   draw_rectangle_lines(dx, dy, TILE_SIZE + 50., TILE_SIZE + 50., 5., YELLOW);
-    //   let mut tdx = 4.;
-    //   let mut tdy = TILE_SIZE;
-    //   for overlap_idx in overlap_idxes {
-    //     draw_text(&format!("{}", overlap_idx), dx + tdx, dy + tdy, TILE_SIZE, WHITE);
-    //     tdx += TILE_SIZE;
-    //     if tdx >= TILE_SIZE + 40. {
-    //       tdx = 4.;
-    //       tdy += TILE_SIZE;
-    //     }
-    //   }
-    // }
     draw_rectangle_lines(x - 10., y - 10., TILE_SIZE + 20., TILE_SIZE + 20., 5., YELLOW);
     draw_texture_ex(
       tex, x, y, WHITE,
@@ -177,6 +156,7 @@ fn draw_patterns(y_offset: f32, pattern_indexes: &[usize], patterns: &[Texture2D
   }
 }
 
+
 struct Grid {
   width: usize,
   height: usize,
@@ -185,7 +165,7 @@ struct Grid {
   entropy: Vec<usize>,
   overlaps: OverlapData,
   colors: Vec<Color>,
-  image: Image,
+  history: Vec<((usize, usize), HashSet<usize>, Vec<Vec<usize>>)>,
 }
 
 impl Grid {
@@ -198,7 +178,7 @@ impl Grid {
       entropy: vec![patterns_length; width * height],
       overlaps: overlaps.clone(),
       colors: colors.clone(),
-      image: Image::gen_image_color(width as u16 * TILE_SIZE as u16, height as u16 * TILE_SIZE as u16, DARKGRAY),
+      history: vec![],
     }
   }
 
@@ -210,15 +190,19 @@ impl Grid {
       let y = y as f32 * TILE_SIZE + GRID_OFFSET;
       if let Some(p) = pattern {
         draw_rectangle(x, y, TILE_SIZE, TILE_SIZE, self.colors[*p]);
-        // draw_texture(textures[*p], x, y, WHITE);
-        // draw_text(&format!("{}", p), x + 4., y + TILE_SIZE / 2., TILE_SIZE, RED);
-      } else {
-        // draw_rectangle_lines(x + 2., y + 2., TILE_SIZE - 4., TILE_SIZE - 4., 3., ORANGE);
-        // draw_text(&format!("{}", self.options[index].len()), x + 4., y + TILE_SIZE / 2., TILE_SIZE, WHITE);
       }
     }
   }
 
+  fn unwind(&mut self) {
+    if let Some(((invalid_pattern, invalid_idx), updated_tiles, options)) = self.history.pop() {
+      for idx in updated_tiles {
+        self.options[idx] = options[idx].clone();
+        self.cells[idx] = None;
+      }
+      self.options[invalid_idx] = options[invalid_idx].iter().filter_map(|p| if *p != invalid_pattern { Some(*p) } else { None }).collect();
+    }
+  }
 
   fn step(&mut self) {
     let _z = ZoneGuard::new("step");
@@ -227,8 +211,16 @@ impl Grid {
     }
 
     let entropy_index = self.observe();
-    self.collapse(entropy_index);
-    self.propagate(entropy_index);
+    if let Some(p) = self.collapse(entropy_index) {
+      let options_store = self.options.clone();
+      let updated_tiles = self.propagate(entropy_index);
+      if self.history.len() == HISTORY_LENGHT {
+        self.history.remove(0);
+      }
+      self.history.push(((p, entropy_index), updated_tiles, options_store));
+    } else {
+      self.unwind();
+    }
   }
 
   fn observe(&self) -> usize {
@@ -256,27 +248,15 @@ impl Grid {
     self.cells.iter().all(|v| v.is_some())
   }
 
-  fn collapse(&mut self, idx: usize) {
+  fn collapse(&mut self, idx: usize) -> Option<usize> {
     let _z = ZoneGuard::new("collapse");
-    // println!("collapsing index {idx}");
-    if let Some(p) = self.options[idx].choose() {
-      self.cells[idx] = Some(*p);
-    }
-    // let mut image = self.texture.get_texture_data();
-    // let (x, y) = xy_from_index(idx, self.width);
-    // let x = x * TILE_SIZE as usize;
-    // let y = y * TILE_SIZE as usize;
-    // let color = self.textures[self.cells[idx]].get_texture_data().get_pixel(0, 0);
-
-    // for ix in 0..TILE_SIZE as usize {
-    //   for iy in 0..TILE_SIZE as usize {
-    //     image.set_pixel((x + ix) as u32, (y + iy) as u32, color);
-    //   }
-    // }
-    // self.texture = Texture2D::from_image(&image);
+    self.options[idx].choose().and_then(|p| {
+     self.cells[idx] = Some(*p);
+     Some(*p)
+    })
   }
 
-  fn propagate(&mut self, idx: usize) {
+  fn propagate(&mut self, idx: usize) -> HashSet<usize> {
     let _z = ZoneGuard::new("propagate");
     let mut stack = vec![idx];
     let mut visited_tiles: HashSet<usize> = HashSet::new();
@@ -285,15 +265,14 @@ impl Grid {
       if visited_tiles.contains(&idx) {
         continue;
       }
+      visited_tiles.insert(idx);
       if self.options[idx].len() == 1 {
-        // println!("setting cell at {neighbour_idx} to {}", self.options[neighbour_idx][0]);
         self.collapse(idx);
       }
       // println!("==================================================");
       // println!("processing index: {}", idx);
       // let directions = [(0, -1), (1, 0), (0, 1), (-1, 0)];
-      let directions = overlap_indexes(N);
-      for (dx, dy) in directions {
+      for (dx, dy) in N_INDEXES {
         let (x, y) = xy_from_index(idx, self.width);
         let nx = x as isize + dx;
         let ny = y as isize + dy;
@@ -324,27 +303,21 @@ impl Grid {
           stack.insert(0, neighbour_idx);
           // self.entropy[neighbour_idx] = options_now;
         }
-        visited_tiles.insert(idx);
       }
     }
+
+    visited_tiles
   }
 }
 
 #[macroquad::main(window_conf)]
 async fn main() {
   set_pc_assets_folder("assets");
-  let image = load_texture("pat-house.png").await.expect("image should be loaded").get_texture_data();
-  println!("processing image");
+  let image = load_texture("pat-bricks-1px.png").await.expect("image should be loaded").get_texture_data();
   let images = extract_patterns_as_images(&image, N);
   println!("extracted {} image patterns", images.len());
-  let pattern_colors: Vec<Color> = images.iter().map(|t| {
-    t.get_pixel(0, 0)
-  }).collect();
-  println!("extracted pixel color");
-  let textures = images_to_textures(&images);
-  println!("converted images to textures");
+  let pattern_colors: Vec<Color> = images.iter().map(|t| t.get_pixel(0, 0)).collect();
   let overlaps = create_overlap_patterns(&images, N);
-  println!("created overlay data");
   let mut play = true;
   let since_the_epoch = SystemTime::now().duration_since(UNIX_EPOCH).expect("Time went backwards");
   let seed = since_the_epoch.as_secs();
@@ -352,20 +325,13 @@ async fn main() {
 
   let width = (SCREEN_WIDTH / TILE_SIZE) as usize;
   let height = (SCREEN_HEIGHT / TILE_SIZE) as usize;
-  // let width = 10;
-  // let height = 10;
-
-  println!("creating grid");
   let mut grid = Grid::new(
     width,
     height,
-    textures.len(),
+    pattern_colors.len(),
     &overlaps,
     &pattern_colors
   );
-  println!("setup done...");
-  // let all_pattern_indexes: Vec<usize> = (0..textures.len()).collect();
-  // let mut grid_index = None;
 
   loop {
     clear_background(DARKGRAY);
@@ -374,39 +340,25 @@ async fn main() {
       grid = Grid::new(
         width,
         height,
-        textures.len(),
+        pattern_colors.len(),
         &overlaps,
         &pattern_colors
       );
+    }
+    if is_key_released(KeyCode::P) {
+      play = !play;
     }
     if is_key_released(KeyCode::Space) {
       grid.step();
     }
     if play {
       grid.step();
-      // play = !grid.is_finished();
     }
-    // if is_mouse_button_released(MouseButton::Left) {
-    //   let (mx, my) = mouse_position();
-    //   let grid_x = ((mx - GRID_OFFSET) / TILE_SIZE) as isize;
-    //   let grid_y = ((my - GRID_OFFSET) / TILE_SIZE) as isize;
-    //   if grid_x >= 0 && grid_x < grid.width as isize && grid_y >= 0 && grid_y < grid.height as isize {
-    //     let grid_i = index_from_xy(grid_x as usize, grid_y as usize, grid.width);
-    //     grid_index = Some(grid_i);
-    //   } else {
-    //     grid_index = None;
-    //   }
-    // }
-    // if let Some(grid_i) = grid_index {
-    //   let (grid_x, grid_y) = xy_from_index(grid_i, grid.width);
-    //   draw_patterns(400.,&grid.options[grid_i], &textures, &format!("Valid patterns at {},{}", grid_x, grid_y), &overlaps);
-    // }
-    // draw_patterns(100., &all_pattern_indexes, &textures, "ALL TILES", &overlaps);
     grid.draw();
 
     #[cfg(debug_assertions)]
     {
-      draw_text(&format!("running: {}", play), 2., 32., 30., WHITE);
+      draw_text(&format!("running: {}, history: {}", play, grid.history.len()), 2., 32., 30., WHITE);
       macroquad_profiler::profiler(Default::default());
     }
 
